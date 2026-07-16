@@ -19,7 +19,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ai-studio
+  IMAGE_NAME: grok2api-studio
 
 jobs:
   verify:
@@ -83,3 +83,4 @@ jobs:
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=gha
           cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max' || '' }}
+

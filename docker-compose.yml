@@ -3,7 +3,7 @@
 services:
   studio:
     container_name: grok2api-studio
-    image: ${STUDIO_IMAGE:-ghcr.io/buttonslaybaugh397-art/ai-studio:latest}
+    image: ${STUDIO_IMAGE:-ghcr.io/buttonslaybaugh397-art/grok2api-studio:latest}
     build:
       context: .
       dockerfile: Dockerfile
@@ -16,4 +16,3 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
-
