@@ -1,0 +1,21 @@
+﻿# dependencies / build
+node_modules/
+dist/
+.cache/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# logs / patches / local junk
+*.log
+*.diff
+*.patch
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
