@@ -43,10 +43,10 @@ docker compose up -d --build
 或直接拉取镜像：
 
 ```bash
-docker pull ghcr.io/buttonslaybaugh397-art/grok2api-studio:latest
+docker pull ghcr.io/buttonslaybaugh397-art/ai-studio:latest
 docker run --rm -p 4175:4175 \
   -e STUDIO_PROXY_TARGET=http://host.docker.internal:8000 \
-  ghcr.io/buttonslaybaugh397-art/grok2api-studio:latest
+  ghcr.io/buttonslaybaugh397-art/ai-studio:latest
 ```
 
 ## 使用说明
@@ -57,3 +57,4 @@ docker run --rm -p 4175:4175 \
 4. 选择对话 / 图片 / 视频模式后生成
 
 视频模式请优先使用 `grok-imagine-video`。
+
