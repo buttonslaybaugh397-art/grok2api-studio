@@ -1,11 +1,12 @@
 /**
- * Standalone reverse-proxy server for Grok Studio.
- * Serves the built SPA and proxies /v1/* to an upstream API to avoid browser CORS.
+ * Static + reverse-proxy server for Grok Studio.
+ * - Serves dist/
+ * - Proxies /v1/* and /openai/* to CPA so browser same-origin requests appear on CPA
+ * - Media proxy for CDN playback
  *
  * Usage:
  *   node server.mjs
  *   set STUDIO_PROXY_TARGET=http://154.201.92.160:8000 && node server.mjs
- *   set PORT=4175 && node server.mjs
  */
 import http from 'node:http';
 import https from 'node:https';
@@ -71,14 +72,84 @@ function serveStatic(req, res) {
   }
 
   if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
-    // SPA fallback
     filePath = path.join(DIST_DIR, 'index.html');
   }
 
   const ext = path.extname(filePath).toLowerCase();
   const type = MIME[ext] || 'application/octet-stream';
-  res.writeHead(200, { 'Content-Type': type, 'Cache-Control': ext === '.html' ? 'no-store' : 'public, max-age=31536000, immutable' });
+  res.writeHead(200, {
+    'Content-Type': type,
+    'Cache-Control': ext === '.html' ? 'no-store' : 'public, max-age=31536000, immutable'
+  });
   fs.createReadStream(filePath).pipe(res);
+}
+
+function resolveProxyTarget(req) {
+  const headerTarget = String(req.headers['x-studio-proxy-target'] || '').trim();
+  if (/^https?:\/\//i.test(headerTarget)) {
+    return headerTarget.replace(/\/+$/, '');
+  }
+  return DEFAULT_TARGET.replace(/\/+$/, '');
+}
+
+function proxyToUpstream(req, res, targetBase) {
+  let target;
+  try {
+    target = new URL(targetBase);
+  } catch {
+    return send(res, 500, {
+      error: {
+        message: `Invalid proxy target: ${targetBase}`,
+        type: 'studio_proxy_invalid_target'
+      }
+    });
+  }
+
+  const isHttps = target.protocol === 'https:';
+  const client = isHttps ? https : http;
+  const incoming = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+  const upstreamPath = `${incoming.pathname}${incoming.search}`;
+
+  const headers = { ...req.headers };
+  // rewrite host to upstream
+  headers.host = target.host;
+  delete headers['accept-encoding'];
+  // hop-by-hop / local-only headers
+  delete headers['x-studio-proxy-target'];
+  delete headers['connection'];
+  delete headers['content-length'];
+
+  console.log(`[grok-studio] proxy ${req.method} ${upstreamPath} -> ${targetBase}`);
+
+  const options = {
+    protocol: target.protocol,
+    hostname: target.hostname,
+    port: target.port || (isHttps ? 443 : 80),
+    method: req.method,
+    path: upstreamPath,
+    headers
+  };
+
+  const upstreamReq = client.request(options, (upstreamRes) => {
+    const outHeaders = { ...upstreamRes.headers };
+    // Ensure browser can read response from same origin freely.
+    outHeaders['access-control-allow-origin'] = '*';
+    res.writeHead(upstreamRes.statusCode || 502, outHeaders);
+    upstreamRes.pipe(res);
+  });
+
+  upstreamReq.on('error', (error) => {
+    console.error('[grok-studio] upstream error', error.message);
+    send(res, 502, {
+      error: {
+        message: `Proxy upstream error: ${error.message}`,
+        type: 'studio_proxy_upstream_error',
+        target: targetBase
+      }
+    });
+  });
+
+  req.pipe(upstreamReq);
 }
 
 function proxyMedia(req, res) {
@@ -103,9 +174,13 @@ function proxyMedia(req, res) {
     const isHttps = target.protocol === 'https:';
     const client = isHttps ? https : http;
     const headers = {
-      // Some CDNs require a UA; keep it simple.
-      'User-Agent': req.headers['user-agent'] || 'GrokStudioMediaProxy/1.0',
-      Accept: req.headers.accept || '*/*'
+      'User-Agent':
+        req.headers['user-agent'] ||
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      Accept: req.headers.accept || 'video/mp4,video/*;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      Referer: 'https://grok.com/',
+      Origin: 'https://grok.com'
     };
     if (req.headers.range) headers.Range = req.headers.range;
 
@@ -114,7 +189,7 @@ function proxyMedia(req, res) {
         protocol: target.protocol,
         hostname: target.hostname,
         port: target.port || (isHttps ? 443 : 80),
-        method: 'GET',
+        method: req.method || 'GET',
         path: `${target.pathname}${target.search}`,
         headers
       },
@@ -123,7 +198,7 @@ function proxyMedia(req, res) {
           'Access-Control-Allow-Origin': '*',
           'Cache-Control': 'private, max-age=300'
         };
-        const pass = [
+        for (const key of [
           'content-type',
           'content-length',
           'content-range',
@@ -131,110 +206,47 @@ function proxyMedia(req, res) {
           'content-disposition',
           'etag',
           'last-modified'
-        ];
-        for (const key of pass) {
+        ]) {
           if (upstreamRes.headers[key]) outHeaders[key] = upstreamRes.headers[key];
         }
-        // Encourage browser download when disposition missing.
-        if (!outHeaders['content-disposition']) {
-          const name = target.pathname.split('/').filter(Boolean).pop() || 'video.mp4';
-          outHeaders['content-disposition'] = `inline; filename="${name}"`;
-        }
+        if (!outHeaders['content-type']) outHeaders['Content-Type'] = 'video/mp4';
         res.writeHead(upstreamRes.statusCode || 502, outHeaders);
+        if ((req.method || 'GET').toUpperCase() === 'HEAD') {
+          res.end();
+          return;
+        }
         upstreamRes.pipe(res);
       }
     );
 
     upstreamReq.on('error', (error) => {
-      if (!res.headersSent) {
-        send(res, 502, {
-          error: {
-            message: error?.message || 'media proxy failed',
-            type: 'studio_media_proxy_error'
-          }
-        });
-      } else {
-        res.end();
-      }
+      send(res, 502, {
+        error: {
+          message: `Media proxy upstream error: ${error.message}`,
+          type: 'studio_media_proxy_error'
+        }
+      });
     });
     upstreamReq.end();
   } catch (error) {
-    return send(res, 500, {
+    send(res, 500, {
       error: {
-        message: error instanceof Error ? error.message : 'media proxy failed',
+        message: error instanceof Error ? error.message : String(error),
         type: 'studio_media_proxy_error'
       }
     });
   }
 }
 
-function proxyToUpstream(req, res, targetBase) {
-  let target;
-  try {
-    target = new URL(targetBase);
-  } catch {
-    return send(res, 500, {
-      error: {
-        message: `Invalid proxy target: ${targetBase}`,
-        type: 'studio_proxy_config_error'
-      }
-    });
-  }
-
-  const incoming = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-  const upstreamPath = incoming.pathname + incoming.search;
-  const isHttps = target.protocol === 'https:';
-  const client = isHttps ? https : http;
-
-  const headers = { ...req.headers };
-  // Upstream host must match target, not the studio origin.
-  headers.host = target.host;
-  // Avoid compressed edge cases while streaming through a simple proxy.
-  delete headers['accept-encoding'];
-  // Content-length will be re-calculated by request body pipe if needed.
-  // Keep original content-length for non-chunked bodies.
-
-  const options = {
-    protocol: target.protocol,
-    hostname: target.hostname,
-    port: target.port || (isHttps ? 443 : 80),
-    method: req.method,
-    path: upstreamPath,
-    headers
-  };
-
-  const upstreamReq = client.request(options, (upstreamRes) => {
-    const outHeaders = { ...upstreamRes.headers };
-    // Studio is same-origin to browser; no need to expose upstream ACAO.
-    // But keep response clean for local use.
-    res.writeHead(upstreamRes.statusCode || 502, outHeaders);
-    upstreamRes.pipe(res);
-  });
-
-  upstreamReq.on('error', (error) => {
-    send(res, 502, {
-      error: {
-        message: `Proxy upstream error: ${error.message}`,
-        type: 'studio_proxy_upstream_error',
-        target: targetBase
-      }
-    });
-  });
-
-  req.pipe(upstreamReq);
-}
-
 const server = http.createServer((req, res) => {
   const urlPath = req.url || '/';
 
-  // Dynamic proxy target for this process. Can be overridden via env.
-  // Browser stays same-origin: /v1/* => this server => upstream.
   if (urlPath.startsWith('/__proxy/media')) {
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET,OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Range',
+        'Access-Control-Allow-Methods': 'GET,HEAD,OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Range, Authorization, X-Studio-Proxy-Target',
         'Access-Control-Max-Age': '86400'
       });
       return res.end();
@@ -245,29 +257,38 @@ const server = http.createServer((req, res) => {
     return proxyMedia(req, res);
   }
 
-  if (urlPath === '/__proxy/health') {
+  if (urlPath === '/__proxy/health' || urlPath.startsWith('/__proxy/health?')) {
     return send(res, 200, {
       ok: true,
-      mode: 'proxy',
+      mode: 'static+api-proxy+media-proxy',
+      apiProxy: true,
+      mediaProxy: true,
       target: DEFAULT_TARGET,
       host: HOST,
-      port: PORT
+      port: PORT,
+      note: 'Browser should use proxy mode (empty baseUrl). Requests to /v1/* and /openai/* are forwarded to CPA.'
     });
   }
 
-  if (urlPath.startsWith('/v1/') || urlPath === '/v1') {
-    return proxyToUpstream(req, res, DEFAULT_TARGET);
-  }
-
-  // Preflight should not normally hit cross-origin here because browser is same-origin.
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD',
-      'Access-Control-Allow-Headers': req.headers['access-control-request-headers'] || 'Authorization, Content-Type',
-      'Access-Control-Max-Age': '86400'
-    });
-    return res.end();
+  // API reverse proxy — this is what makes calls visible on CPA.
+  if (
+    urlPath.startsWith('/v1/') ||
+    urlPath === '/v1' ||
+    urlPath.startsWith('/openai/') ||
+    urlPath === '/openai'
+  ) {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD',
+        'Access-Control-Allow-Headers':
+          req.headers['access-control-request-headers'] ||
+          'Authorization, Content-Type, X-Studio-Proxy-Target',
+        'Access-Control-Max-Age': '86400'
+      });
+      return res.end();
+    }
+    return proxyToUpstream(req, res, resolveProxyTarget(req));
   }
 
   return serveStatic(req, res);
@@ -275,6 +296,6 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`[grok-studio] http://${HOST}:${PORT}`);
-  console.log(`[grok-studio] proxy /v1/* -> ${DEFAULT_TARGET}`);
+  console.log(`[grok-studio] proxy /v1/* and /openai/* -> ${DEFAULT_TARGET}`);
   console.log(`[grok-studio] health  /__proxy/health`);
 });

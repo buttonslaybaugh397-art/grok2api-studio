@@ -3,25 +3,21 @@ import type {
   ChatMessage,
   ImageResult,
   ModelItem,
+  VideoGeneratePayload,
   VideoStatusResult
 } from './types';
 
 function normalizeBaseUrl(baseUrl: string) {
   let base = baseUrl.trim().replace(/\/+$/, '');
-  // Users often paste ".../v1". Paths already include /v1/...
   if (/\/v1$/i.test(base)) {
     base = base.replace(/\/v1$/i, '');
   }
   return base;
 }
 
-/**
- * CORS strategy for the standalone Studio:
- * - proxy mode: always call same-origin /v1/* (local reverse proxy forwards upstream)
- * - direct mode: call config.baseUrl directly (requires upstream CORS)
- */
 export function resolveRequestBaseUrl(config: AppConfig) {
-  if ((config.connectionMode || 'proxy') === 'proxy') {
+  // proxy mode: browser calls same-origin /v1 and /openai, local server forwards to CPA
+  if ((config.connectionMode || 'proxy') !== 'direct') {
     return '';
   }
   return normalizeBaseUrl(config.baseUrl);
@@ -37,11 +33,13 @@ function requestBase(config: AppConfig) {
   return resolveRequestBaseUrl(config);
 }
 
-function authHeaders(apiKey: string, extra: HeadersInit = {}) {
-  return {
+function authHeaders(apiKey: string, extra: HeadersInit = {}, proxyTarget?: string) {
+  const headers: Record<string, string> = {
     Authorization: `Bearer ${apiKey.trim()}`,
-    ...extra
+    ...(extra as Record<string, string>)
   };
+  if (proxyTarget) headers['X-Studio-Proxy-Target'] = proxyTarget;
+  return headers;
 }
 
 async function parseError(response: Response) {
@@ -54,11 +52,7 @@ async function parseError(response: Response) {
   }
 }
 
-async function requestJson<T>(
-  config: AppConfig,
-  path: string,
-  init: RequestInit = {}
-): Promise<T> {
+async function requestJson<T>(config: AppConfig, path: string, init: RequestInit = {}): Promise<T> {
   if (!config.apiKey.trim()) {
     throw new Error('请先填写 API Key');
   }
@@ -70,6 +64,10 @@ async function requestJson<T>(
   if (init.body && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
+  if ((config.connectionMode || 'proxy') !== 'direct') {
+    const target = String(config.proxyTarget || '').trim();
+    if (target) headers.set('X-Studio-Proxy-Target', target);
+  }
 
   let response: Response;
   try {
@@ -80,9 +78,7 @@ async function requestJson<T>(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (/Failed to fetch|NetworkError|CORS/i.test(message)) {
-      throw new Error(
-        '网络请求失败（常见原因是浏览器跨域 CORS）。请改用“本地代理”模式，或确认上游已开启 CORS。'
-      );
+      throw new Error('网络请求失败（常见原因是浏览器跨域 CORS）。请改用“本地代理”模式，或确认上游已开启 CORS。');
     }
     throw error;
   }
@@ -90,11 +86,9 @@ async function requestJson<T>(
   if (!response.ok) {
     throw new Error(await parseError(response));
   }
-
   if (response.status === 204) {
     return {} as T;
   }
-
   return response.json() as Promise<T>;
 }
 
@@ -110,35 +104,27 @@ function extractText(payload: any): string {
     const content = choice.message.content;
     if (typeof content === 'string') return content;
     if (Array.isArray(content)) {
-      return content
-        .map((part: any) => part?.text || part?.content || '')
-        .filter(Boolean)
-        .join('\n');
+      return content.map((part: any) => part?.text || part?.content || '').filter(Boolean).join('');
     }
   }
-
-  if (Array.isArray(payload.output)) {
-    return payload.output
-      .flatMap((item: any) => item?.content || [])
-      .map((part: any) => part?.text || part?.content || '')
-      .filter(Boolean)
-      .join('\n');
+  if (choice?.delta?.content) {
+    return typeof choice.delta.content === 'string' ? choice.delta.content : '';
   }
-
+  if (choice?.text) return String(choice.text);
   return '';
 }
 
 export async function fetchModels(config: AppConfig) {
   const raw = await requestJson<any>(config, '/v1/models', { method: 'GET' });
-  const list = Array.isArray(raw?.data) ? raw.data : Array.isArray(raw) ? raw : [];
+  const list: ModelItem[] = Array.isArray(raw?.data) ? raw.data : Array.isArray(raw) ? raw : [];
   return list
     .map((item: any) => ({
-      id: item.id || item.model || item.name || '',
-      object: item.object,
-      owned_by: item.owned_by,
-      created: item.created
+      id: String(item?.id || item?.name || '').trim(),
+      object: item?.object,
+      owned_by: item?.owned_by,
+      created: item?.created
     }))
-    .filter((item: ModelItem) => Boolean(item.id)) as ModelItem[];
+    .filter((item: ModelItem) => item.id);
 }
 
 export async function streamChat(
@@ -160,7 +146,16 @@ export async function streamChat(
   try {
     response = await fetch(buildUrl(requestBase(config), '/v1/chat/completions'), {
       method: 'POST',
-      headers: authHeaders(config.apiKey, { 'Content-Type': 'application/json' }),
+      headers: {
+        ...authHeaders(
+          config.apiKey,
+          {
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream'
+          },
+          (config.connectionMode || 'proxy') !== 'direct' ? config.proxyTarget : undefined
+        )
+      },
       body: JSON.stringify({
         model: payload.model,
         messages: payload.messages,
@@ -173,9 +168,7 @@ export async function streamChat(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (/Failed to fetch|NetworkError|CORS/i.test(message)) {
-      throw new Error(
-        '流式请求失败（常见原因是浏览器跨域 CORS）。请改用“本地代理”模式，或确认上游已开启 CORS。'
-      );
+      throw new Error('网络请求失败（常见原因是浏览器跨域 CORS）。请改用“本地代理”模式，或确认上游已开启 CORS。');
     }
     throw error;
   }
@@ -183,61 +176,46 @@ export async function streamChat(
   if (!response.ok) {
     throw new Error(await parseError(response));
   }
-
   if (!response.body) {
-    const raw = await response.json();
-    const content = extractText(raw);
-    if (content) payload.onDelta(content);
-    return { content, raw };
+    throw new Error('上游未返回流式响应体');
   }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder('utf-8');
   let buffer = '';
-  let content = '';
-  let lastPayload: any = null;
+  let full = '';
+  const rawChunks: any[] = [];
 
-  const handleEvent = (chunk: string) => {
-    const lines = chunk.split(/\r?\n/);
-    for (const line of lines) {
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split(/\r?\n/);
+    buffer = parts.pop() || '';
+    for (const line of parts) {
       const trimmed = line.trim();
       if (!trimmed.startsWith('data:')) continue;
       const data = trimmed.slice(5).trim();
       if (!data || data === '[DONE]') continue;
       try {
         const json = JSON.parse(data);
-        lastPayload = json;
+        rawChunks.push(json);
         const delta =
-          json.choices?.[0]?.delta?.content ||
-          json.choices?.[0]?.message?.content ||
-          json.delta?.content ||
+          json?.choices?.[0]?.delta?.content ||
+          json?.choices?.[0]?.message?.content ||
+          json?.choices?.[0]?.text ||
           '';
         if (typeof delta === 'string' && delta) {
-          content += delta;
+          full += delta;
           payload.onDelta(delta);
         }
       } catch {
-        // ignore partial json
+        // ignore non-json sse lines
       }
-    }
-  };
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let boundary = buffer.search(/\r?\n\r?\n/);
-    while (boundary !== -1) {
-      const event = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary).replace(/^\r?\n\r?\n/, '');
-      handleEvent(event);
-      boundary = buffer.search(/\r?\n\r?\n/);
     }
   }
 
-  if (buffer.trim()) handleEvent(buffer);
-  if (!content && lastPayload) content = extractText(lastPayload);
-  return { content, raw: lastPayload };
+  return { content: full, raw: rawChunks };
 }
 
 export async function generateChat(
@@ -281,33 +259,109 @@ export async function generateImage(
       n: payload.n,
       size: payload.size || undefined,
       aspect_ratio: payload.aspectRatio || undefined,
-      response_format: payload.responseFormat || 'url'
+      response_format: payload.responseFormat || 'b64_json'
     })
   });
   return { created: raw.created, data: raw.data ?? [], raw } satisfies ImageResult;
 }
 
-export async function generateVideo(
-  config: AppConfig,
-  payload: {
-    model: string;
-    prompt: string;
-    duration: string | number;
-    aspectRatio: string;
-    resolution: string;
+function mapAspectRatioToSize(_aspectRatio?: string, resolution?: string) {
+  const res = String(resolution || '').trim().toLowerCase();
+  if (res === '1080p') return '1920x1080';
+  if (res === '480p') return '848x480';
+  return '1280x720';
+}
+
+function normalizeVideoSeconds(value: string | number | undefined, fallback = 4) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(1, Math.min(15, Math.round(n)));
+}
+
+export async function generateVideo(config: AppConfig, payload: VideoGeneratePayload) {
+  const refs = (payload.referenceImageUrls || []).map((item) => String(item || '').trim()).filter(Boolean);
+  const single = String(payload.imageUrl || '').trim();
+  const all = Array.from(new Set([...(refs.length ? refs : []), ...(single ? [single] : [])]
+    .map((item) => String(item || '').trim())
+    .filter((url) => Boolean(url) && !url.startsWith('blob:'))))
+    .slice(0, 7);
+
+  // CPA/xAI: multi-reference duration is capped at 10s.
+  let seconds = normalizeVideoSeconds(payload.seconds ?? payload.duration, 4);
+  if (all.length > 1 && seconds > 10) seconds = 10;
+
+  const size = payload.size || mapAspectRatioToSize(payload.aspectRatio, payload.resolution);
+
+  const prompt = String(payload.prompt || '').trim();
+  if (!prompt) {
+    throw new Error('提示词(prompt)不能为空');
   }
-) {
-  const durationValue = Number(payload.duration);
-  return requestJson<any>(config, '/v1/videos/generations', {
-    method: 'POST',
-    body: JSON.stringify({
+
+  function buildBody(mode: 'openai' | 'native'): Record<string, unknown> {
+    const body: Record<string, unknown> = {
       model: payload.model,
-      prompt: payload.prompt,
-      duration: Number.isFinite(durationValue) ? durationValue : 8,
-      aspect_ratio: payload.aspectRatio || undefined,
-      resolution: payload.resolution || undefined
-    })
-  });
+      prompt,
+      seconds: String(seconds),
+      size
+    };
+    if (payload.aspectRatio) body.aspect_ratio = payload.aspectRatio;
+    if (payload.resolution) body.resolution = payload.resolution;
+    if (mode === 'native') body.duration = seconds;
+
+    // Exclusive image fields only.
+    if (all.length === 1) {
+      // Prefer input_reference for OpenAI-compatible path; native path also accepts it.
+      if (payload.useInputReference === false) {
+        body.image = { url: all[0] };
+      } else {
+        body.input_reference = { image_url: all[0] };
+      }
+    } else if (all.length > 1) {
+      body.reference_images = all.map((url) => ({ url }));
+    }
+    return body;
+  }
+
+  if (all.length === 0 && (refs.length || single)) {
+    throw new Error('参考图地址无效（仅支持 data: 或 http(s) 图片 URL）');
+  }
+
+  const attempts = [
+    { path: '/v1/videos', body: buildBody('openai') },
+    { path: '/v1/videos/generations', body: buildBody('native') }
+  ];
+
+  let lastError: Error | null = null;
+  for (const attempt of attempts) {
+    try {
+      // Ensure prompt is still present after body construction.
+      if (!String((attempt.body as any).prompt || '').trim()) {
+        throw new Error('内部错误：请求体缺少 prompt');
+      }
+      const result = await requestJson<any>(config, attempt.path, {
+        method: 'POST',
+        body: JSON.stringify(attempt.body)
+      });
+      return {
+        ...result,
+        // echo for UI debugging without relying on upstream
+        _studio_request: {
+          path: attempt.path,
+          prompt,
+          referenceCount: all.length,
+          hasInputReference: Boolean((attempt.body as any).input_reference),
+          hasImage: Boolean((attempt.body as any).image),
+          hasReferenceImages: Boolean((attempt.body as any).reference_images)
+        }
+      };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      lastError = new Error(
+        `${msg}（已发送 prompt 长度=${prompt.length}, 参考图=${all.length}, path=${attempt.path}）`
+      );
+    }
+  }
+  throw lastError || new Error('视频生成失败');
 }
 
 export async function fetchVideoStatus(config: AppConfig, requestId: string) {
@@ -315,19 +369,29 @@ export async function fetchVideoStatus(config: AppConfig, requestId: string) {
   const nestedVideo = raw?.video && typeof raw.video === 'object' ? raw.video : null;
   const url =
     nestedVideo?.url ||
+    nestedVideo?.video_url ||
+    nestedVideo?.download_url ||
     raw?.url ||
     raw?.output_url ||
     raw?.video_url ||
+    raw?.download_url ||
+    raw?.result?.url ||
     raw?.output?.url ||
+    raw?.output?.video_url ||
     raw?.data?.url ||
+    raw?.data?.video?.url ||
     '';
 
-  // Official grok2api shape uses pending | done | failed.
   const rawStatus = String(raw?.status || nestedVideo?.status || '').toLowerCase();
-  let status = rawStatus || (url ? 'done' : 'pending');
-  if (['completed', 'succeeded', 'success', 'complete'].includes(status)) status = 'done';
-  if (['error', 'canceled', 'cancelled'].includes(status)) status = 'failed';
-  if (['in_progress', 'processing', 'queued', 'running', 'submitted'].includes(status)) status = 'pending';
+  let status = rawStatus;
+  if (['completed', 'succeeded', 'success', 'complete', 'done'].includes(status)) status = 'done';
+  else if (['error', 'canceled', 'cancelled', 'failed', 'expired'].includes(status)) status = 'failed';
+  else if (['in_progress', 'processing', 'queued', 'running', 'submitted', 'pending'].includes(status)) status = 'pending';
+  else if (!status) {
+    // Only infer done from url when status is completely missing AND progress is 100.
+    const progress = typeof raw?.progress === 'number' ? raw.progress : nestedVideo?.progress;
+    status = url && progress === 100 ? 'done' : url ? 'pending' : 'pending';
+  }
 
   const errorMessage =
     raw?.error?.message ||
@@ -336,38 +400,215 @@ export async function fetchVideoStatus(config: AppConfig, requestId: string) {
     nestedVideo?.error ||
     '';
 
+  const duration =
+    nestedVideo?.duration ??
+    raw?.duration ??
+    raw?.seconds ??
+    raw?.output?.duration ??
+    undefined;
+
   return {
-    id: raw?.id ?? raw?.request_id ?? requestId,
+    // Always keep the requested task id. Do not let upstream swap in another id.
+    id: requestId,
     status,
     output: raw?.output ?? nestedVideo,
     url: url || undefined,
+    content_path:
+      nestedVideo?.content_path ||
+      nestedVideo?.content_url ||
+      raw?.content_path ||
+      raw?.content_url ||
+      undefined,
+    content_url:
+      nestedVideo?.content_url ||
+      nestedVideo?.content_path ||
+      raw?.content_url ||
+      raw?.content_path ||
+      undefined,
     progress: typeof raw?.progress === 'number' ? raw.progress : undefined,
+    duration,
+    model: raw?.model || nestedVideo?.model || undefined,
     error: errorMessage || undefined,
     raw
   } satisfies VideoStatusResult;
 }
 
-export function toDataUrl(base64: string) {
-  return `data:image/png;base64,${base64}`;
+export async function downloadVideoContent(config: AppConfig, videoId: string, filename = 'video.mp4') {
+  const objectUrl = await fetchVideoObjectUrl(config, videoId);
+  try {
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    const safeName = String(videoId || 'video').trim() || 'video';
+    anchor.download = filename || (safeName + '.mp4');
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1500);
+  }
+}
+
+export async function fetchVideoObjectUrl(
+  config: AppConfig,
+  videoId: string,
+  preferredPaths: string[] = []
+): Promise<string> {
+  if (!config.apiKey.trim()) throw new Error('请先填写 API Key');
+  const id = String(videoId || '').trim();
+  if (!id) throw new Error('缺少视频任务 ID');
+
+  // Prefer gateway content relay first (native grok2api authenticated re-fetch),
+  // then optional status-provided content paths, then CPA OpenAI-compatible path.
+  const pathCandidates = [
+    ...preferredPaths.map((item) => String(item || '').trim()).filter(Boolean),
+    '/v1/videos/' + encodeURIComponent(id) + '/content',
+    '/openai/v1/videos/' + encodeURIComponent(id) + '/content'
+  ];
+  const seen = new Set<string>();
+  const candidates: string[] = [];
+  for (const path of pathCandidates) {
+    const url =
+      path.startsWith('http://') || path.startsWith('https://')
+        ? path
+        : buildUrl(requestBase(config), path.startsWith('/') ? path : '/' + path);
+    if (!seen.has(url)) {
+      seen.add(url);
+      candidates.push(url);
+    }
+  };
+
+  let lastError: Error | null = null;
+  for (const url of candidates) {
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: authHeaders(
+          config.apiKey,
+          {
+            Accept: 'video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5',
+            'Cache-Control': 'no-cache'
+          },
+          (config.connectionMode || 'proxy') !== 'direct' ? config.proxyTarget : undefined
+        ),
+        cache: 'no-store'
+      });
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+      const contentType = (response.headers.get('content-type') || '').toLowerCase();
+      if (contentType.includes('application/json') || contentType.includes('text/')) {
+        const text = await response.text();
+        throw new Error(text.slice(0, 300) || 'CPA 返回了非视频内容');
+      }
+      const blob = await response.blob();
+      if (!blob || blob.size < 1000) {
+        throw new Error('视频内容为空或任务尚未可下载');
+      }
+      const typed =
+        blob.type && blob.type.startsWith('video/')
+          ? blob
+          : new Blob([blob], { type: 'video/mp4' });
+      return URL.createObjectURL(typed);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+    }
+  }
+  throw lastError || new Error('通过 CPA 获取视频内容失败');
+}
+
+export async function fetchRemoteVideoObjectUrl(remoteUrl: string): Promise<string> {
+  const url = String(remoteUrl || '').trim();
+  if (!url) throw new Error('缺少远程视频地址');
+  if (url.startsWith('blob:') || url.startsWith('data:')) return url;
+
+  const candidates = [mediaProxyUrl(url), url].filter(Boolean);
+  let lastError: Error | null = null;
+  for (const candidate of candidates) {
+    try {
+      const response = await fetch(candidate, {
+        method: 'GET',
+        headers: {
+          Accept: 'video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5'
+        }
+      });
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+      const blob = await response.blob();
+      if (!blob || blob.size < 1000) {
+        throw new Error('远程视频内容为空');
+      }
+      const typed =
+        blob.type && blob.type.startsWith('video/')
+          ? blob
+          : new Blob([blob], { type: 'video/mp4' });
+      return URL.createObjectURL(typed);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+    }
+  }
+  throw lastError || new Error('远程视频拉取失败');
+}
+
+
+export function cpaVideoContentPath(videoId: string, variant: 'openai' | 'native' = 'openai') {
+  const id = String(videoId || '').trim();
+  if (!id) return '';
+  if (variant === 'native') {
+    return '/v1/videos/' + encodeURIComponent(id) + '/content';
+  }
+  return '/openai/v1/videos/' + encodeURIComponent(id) + '/content';
+}
+
+export function toDataUrl(base64: string, mime = 'image/png') {
+  const clean = String(base64 || '').replace(/^data:[^;]+;base64,/, '');
+  return `data:${mime || 'image/png'};base64,${clean}`;
+}
+
+export function sniffImageMimeFromBase64(base64: string) {
+  const clean = String(base64 || '').replace(/^data:[^;]+;base64,/, '').replace(/\s+/g, '');
+  if (clean.startsWith('/9j/')) return 'image/jpeg';
+  if (clean.startsWith('iVBOR')) return 'image/png';
+  if (clean.startsWith('R0lGOD')) return 'image/gif';
+  if (clean.startsWith('UklGR')) return 'image/webp';
+  return 'image/png';
+}
+
+export async function fileToDataUrl(file: File | Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('读取本地图片失败'));
+    reader.readAsDataURL(file);
+  });
+}
+
+export async function probeImageMeta(src: string): Promise<{ width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve({ width: img.naturalWidth || 0, height: img.naturalHeight || 0 });
+    img.onerror = () => reject(new Error('无法读取图片尺寸'));
+    img.src = src;
+  });
 }
 
 export function imageSrc(item: { url?: string; b64_json?: string }) {
   if (item.url) return item.url;
-  if (item.b64_json) return toDataUrl(item.b64_json);
+  if (item.b64_json) return toDataUrl(item.b64_json, sniffImageMimeFromBase64(item.b64_json));
   return '';
 }
 
-/** Same-origin media proxy to avoid CORS when downloading remote video/image assets. */
 export function mediaProxyUrl(remoteUrl: string) {
   if (!remoteUrl) return '';
   if (remoteUrl.startsWith('blob:') || remoteUrl.startsWith('data:')) return remoteUrl;
+  if (remoteUrl.startsWith('/__proxy/media')) return remoteUrl;
+  // Only media proxy remains (API proxy is gone). Helps CDN playback with Referer.
   return `/__proxy/media?url=${encodeURIComponent(remoteUrl)}`;
 }
 
 export async function downloadRemoteFile(remoteUrl: string, filename: string) {
   if (!remoteUrl) throw new Error('没有可下载的地址');
 
-  // Prefer same-origin media proxy first to avoid browser CORS blocking blob download.
   const candidates: string[] = [];
   if (/^https?:\/\//i.test(remoteUrl)) {
     candidates.push(mediaProxyUrl(remoteUrl));
@@ -398,4 +639,3 @@ export async function downloadRemoteFile(remoteUrl: string, filename: string) {
 
   throw lastError || new Error('下载失败');
 }
-
